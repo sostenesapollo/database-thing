@@ -6,10 +6,10 @@ import { prisma } from "~/db.server";
 import { Input } from "~/components/ui/input";
 import { useEffect, useState } from "react";
 import axios from 'axios';
-import { deleteFile, downloadFile, getFiles } from "./files";
+import { deleteFile, downloadFile, getFilesFromS3 } from "./files";
 import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from "~/components/ui/table";
 import dayjs from '../../node_modules/dayjs/esm/index';
-import { countRecords } from "~/lib/postgres";
+import { countDatabaseRows } from "~/lib/postgres";
 import { listBuckets, removeFile, restoreDatabase } from "~/lib/backup";
 import { twMerge } from "tailwind-merge";
 import { ToastContainer, toast } from 'react-toastify';
@@ -17,24 +17,31 @@ import 'react-toastify/dist/ReactToastify.css';
 import { cronToText } from "~/lib/cron";
 
 const presetValues = {
-  cron: '0 * * * *',
-  device: 'mac',
-  bucket: 'pedegasbackups',
-  s3MaxFilesToKeep: 5,
-  // Db 
-  databaseType: 'postgresql',
-  user: 'postgres',
-  password: 'postgres',
-  host: 'localhost',
-  port: '5432',
-  database: 'pedegas',
-  // Redis
-  redisHost: 'localhost',
-  redisUser: '',
-  redisPort: '6379',
-  redisPassword: 'eYVX7EwVmmxKPCDmwMtyKVge8oLd2t81',
-  // 
-  action: '',
+  databases: [{
+    id: '112343',
+    name: 'Main Database',
+    enabled: true,
+    expanded: false,
+    // Database settings
+    databaseType: 'postgresql',
+    user: 'postgres',
+    password: 'postgres',
+    host: 'localhost',
+    port: '5432',
+    database: 'pedegas',
+    // S3 and Cron settings
+    device: 'mac',
+    bucket: 'pedegasbackups',
+    s3MaxFilesToKeep: 5,
+    cron: '0 * * * *',
+    // Redis settings
+    redisHost: 'localhost',
+    redisUser: '',
+    redisPort: '6379',
+    redisPassword: 'eYVX7EwVmmxKPCDmwMtyKVge8oLd2t81',
+    // Action
+    action: '',
+  }],
 };
 
 export async function action({ request }: any) {
@@ -42,7 +49,7 @@ export async function action({ request }: any) {
   // console.log('body', body);
 
   try {
-    const count =await countRecords()
+    const count =await countDatabaseRows()
     // console.log(count);
     
   }catch(e){
@@ -97,54 +104,37 @@ export async function getDeviceName() {
 
 export async function loader() {
   const result = await prisma.setting.findFirst();
-  
-  if (!result) {
-    await prisma.setting.create({ data: { key: 'settings', value: JSON.stringify(presetValues) } });
-    return {
-      date: new Date(),
-      result: presetValues,
-    };
-  }
-  
-  const bucket = await getBucketName();
-  
-  let files = []
-  let error = null;
-  try {
-    files = await getFiles(bucket);
-  } catch (_error) {
-    error = _error
+  const parsedResult = JSON.parse(result?.value || JSON.stringify({}));
+  const errors = [];
+
+  const dbResults: { count:number, last_sale:string}[] = []
+
+  for(const db of parsedResult.databases){
+    dbResults[db.name] = { count: 0, last_sale: '' }
+    try {
+      const res = await countDatabaseRows(db, 'orders')
+      dbResults[db.name].count = res.count;
+      dbResults[db.name].last_sale = res.last_sale;
+    } catch (e) {
+      console.error('> Error to count Records:', e.message);
+      errors.push(e)
+    }
   }
 
-  console.log('files', files?.length);
-  
-
-  let count, last_sale;
-  try {
-    const res = await countRecords('orders')
-    count = res.count;
-    last_sale = res.last_sale;
-  } catch (e) {
-    error = e.message;
-    console.error('> Error to count Records:', error, 'msg:', e.message);
-  }
-
-  let buckets = [];
+  let buckets: (string | undefined)[] = [] ;
   try {
     buckets = await listBuckets()
   } catch (e) {
-    error = e.message;
-    console.error('>', error, 'msg:', e.message);
+    console.error('>', e.message, e);
+    errors.push('Error to list buckets')
   }
 
   return {
     date: new Date(),
-    result: JSON.parse(result.value),
-    files: files,
-    error,
-    count,
-    last_sale,
-    buckets
+    result: parsedResult,
+    buckets,
+    dbResults,
+    errors
   };
 }
 
@@ -155,40 +145,70 @@ const Loading = ({className=""}) => <svg aria-hidden="true" className={`inline w
 
 export default function Index() {
   const _data = useLoaderData<typeof loader>();
+  const [data, setData] = useState({
+    ..._data,
+    result: {
+      ..._data.result,
+      files: [],
+      databases: _data.result.databases || [{
+        id: '1',
+        name: 'Main Database',
+        enabled: true,
+        databaseType: 'postgresql',
+        user: 'postgres',
+        password: 'postgres',
+        host: 'localhost',
+        port: '5432',
+        database: 'pedegas',
+      }]
+    }
+  });
 
-  const [data, setData] = useState(_data);
   const [loading, setLoading] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
+  const [selectedBucket, setSelectedBucket] = useState<string>('all');
+  const [savingIds, setSavingIds] = useState<string[]>([]);
+  const [lastAddedId, setLastAddedId] = useState<string | null>(null);
+  const [clickedId, setClickedId] = useState<number | null>(null);
+  const [files, setFiles] = useState<{}[]>([]);
 
-  const update = async () => {
+  const _setSelectedBucket = async (bucketName: string) => {
+    setSelectedBucket(bucketName);
+    try {
+      console.log('Loading files... from bucket', bucketName)
+      const result = await axios.get(`/files?bucket=${bucketName}`)
+      console.log(result?.data?.files)
+      setFiles(result?.data?.files || [])
+    } catch (e) {
+      toast.error('Error to list files from bucket')
+    }
+  }
+
+  const update = async (db: any) => {
+    setSavingIds((ids) => [...ids, db.id]);
     try {
       await axios.post('/backup', {...data, action: 'update', files: undefined, buckets: undefined});
       if(data.error) {
         window.location.reload();
       }
-      setSuccessMessage('Updated successfully.');
+      setSuccessMessage(`${db.name} atualizado com sucesso.`);
       reloadFiles();
-      setTimeout(() => setSuccessMessage(''), 2000); // Hide message after 2 seconds
+      setTimeout(() => setSuccessMessage(''), 2000);
     } catch (error) {
-      console.error('Update failed:', error);
+      console.error('Falha na atualização:', error);
+    } finally {
+      setSavingIds((ids) => ids.filter(id => id !== db.id));
     }
   };
 
-  const [clickedId, setClickedId] = useState(null);
-  const [confirmRemoveId, setConfirmRemoveId] = useState(null);
-  const [loadingRemove, setLoadingRemove] = useState(false);
-
   const remove = async (key: string) => {
-    // setLoadingRemove(true);
     try {
       await axios.post('/backup', {key, action: 'delete'});
       setSuccessMessage('Removido com sucesso.');
       reloadFiles();
-      setTimeout(() => setSuccessMessage(''), 2000); // Hide message after 2 seconds
+      setTimeout(() => setSuccessMessage(''), 2000);
     } catch (error) {
-      console.error('Update failed:', error);
-    } finally {
-      // setLoadingRemove(false);
+      console.error('Falha ao remover:', error);
     }
   }
 
@@ -203,8 +223,9 @@ export default function Index() {
   };
 
   const restore = async (fileKey: string) => {
-    setClickedId(()=>fileKey as any)
+    setClickedId(id);
     setAction(()=> 'restore' as any)
+    restore(file.key)
   }
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -268,359 +289,458 @@ export default function Index() {
   const textCron = cronToText(data.result.cron);
   const isSaveDisabled = textCron?.error;
 
+  // Add database form
+  const addDatabase = () => {
+    const newId = Date.now().toString();
+    setData((prevData) => ({
+      ...prevData,
+      result: {
+        ...prevData.result,
+        databases: [...prevData.result.databases, {
+          id: newId,
+          name: 'New Database',
+          enabled: true,
+          databaseType: 'postgresql',
+          user: '',
+          password: '',
+          host: 'localhost',
+          port: '5432',
+          database: '',
+          bucket: data?.buckets?.at(0)
+        }]
+      }
+    }));
+    setLastAddedId(newId);
+  };
+
+  useEffect(() => {
+    if (lastAddedId) {
+      const input = document.querySelector(`input[data-id="${lastAddedId}"]`) as HTMLInputElement;
+      if (input) {
+        input.focus();
+        input.select();
+        setLastAddedId(null);
+      }
+    }
+  }, [lastAddedId]);
+
+  // Remove database
+  const removeDatabase = async (id: string) => {
+    setData((prevData) => ({
+      ...prevData,
+      result: {
+        ...prevData.result,
+        databases: prevData.result.databases.filter(db => db.id !== id)
+      }
+    }));
+    await remove(id)
+  };
+
+  // Handle database change
+  const handleDatabaseChange = (id: string, field: string, value: string) => {
+    setData((prevData) => ({
+      ...prevData,
+      result: {
+        ...prevData.result,
+        databases: prevData.result.databases.map(db => 
+          db.id === id ? { ...db, [field]: value } : db
+        )
+      }
+    }));
+  };
+
+  const toggleExpand = (id: string) => {
+    setData((prevData) => ({
+      ...prevData,
+      result: {
+        ...prevData.result,
+        databases: prevData.result.databases.map(db => 
+          db.id === id ? { ...db, expanded: !db.expanded } : db
+        )
+      }
+    }));
+  };
+
+  // Handle Enter key on database name
+  const handleKeyPress = (e: React.KeyboardEvent, db: any) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      update(db);
+    }
+  };
+
   return (
-    <section className="">
-      <ToastContainer />
+    <>
+      <ToastContainer 
+        position="top-right"
+        autoClose={5000}
+        hideProgressBar={false}
+        newestOnTop={true}
+        closeOnClick
+        rtl={false}
+        pauseOnFocusLoss
+        draggable
+        pauseOnHover
+        theme="light"
+        style={{ 
+          zIndex: 9999,
+          position: 'fixed',
+          top: 20,
+          right: 20,
+        }}
+      />
 
-      <div className="flex">
-        {/* <div>
-          <pre>
-            {JSON.stringify(data, null, 2)}
-          </pre>
-        </div> */}
-        <div>
-          {messages.map((message: any, index) => (
-            message?.error ? 
-              <p key={index} className="bg-red-300 px-2">{message.error}</p> :
-              <p key={index} className="bg-green-400">{message}</p>
-          ))}
-        </div>
-      </div>   
+      <section className="relative">
+        <div className="flex">
+          <div>
+            <pre>
+              {JSON.stringify(data, null, 2)}
+            </pre>
+          </div>
+          <div>
+            {messages.map((message: any, index) => (
+              message?.error ? 
+                <p key={index} className="bg-red-300 px-2">{message.error}</p> :
+                <p key={index} className="bg-green-400">{message}</p>
+            ))}
+          </div>
+        </div>   
 
-      <nav className="flex items-center justify-between p-4 w-full">
-        <Link to="/" className="flex items-center space-x-2">
-          <DatabaseBackup className="h-8 w-8" />
-          <h1 className="text-xl font-semibold">Database Thing</h1>
-        </Link>
-        <ThemeToggle />
-      </nav>
+        <nav className="flex items-center justify-between p-4 w-full">
+          <Link to="/" className="flex items-center space-x-2">
+            <DatabaseBackup className="h-8 w-8" />
+            <h1 className="text-xl font-semibold">Database Thing</h1>
+          </Link>
+          <ThemeToggle />
+        </nav>
 
-      {successMessage &&(
-        <span className={`fixed bottom-4 right-4 bg-green-600 text-white p-3 rounded shadow-lg transition-transform duration-500 ${successMessage ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-10'}`}>
-          {successMessage}
-        </span>
-      )}
-      
-      {data?.error && (
-        <span className={`fixed bottom-4 right-4 bg-red-600 text-white p-3 rounded shadow-lg transition-transform duration-500 opacity-100 z-10 translate-y-0`}>
-          Error check the logs:
-          <pre>
-          {JSON.stringify(data?.error, null, 2)}
-          </pre>
-        </span>
-      )}
-
-      <div className="container flex flex-col space-y-4">
-        <form onSubmit={(e)=>{ e.preventDefault(); update()} }>
+        {successMessage &&(
+          <span className={`fixed bottom-4 right-4 bg-green-600 text-white p-3 rounded shadow-lg transition-transform duration-500 ${successMessage ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-10'}`}>
+            {successMessage}
+          </span>
+        )}
         
-          <p className="font-bold text-xl">S3 and Cron settings</p>
+        {data?.error && (
+          <span className={`fixed bottom-4 right-4 bg-red-600 text-white p-3 rounded shadow-lg transition-transform duration-500 opacity-100 z-10 translate-y-0`}>
+            Error check the logs:
+            <pre>
+            {JSON.stringify(data?.error, null, 2)}
+            </pre>
+          </span>
+        )}
 
-          <div className="flex flex-row items-start flex-grow gap-3">
-            <div className="flex flex-col grow-1">
-              <label htmlFor="device" className="mb-2 font-medium">Device label</label>
-              <Input
-                id="device"
-                placeholder="Dispositivo"
-                name="device"
-                value={data.result.device}
-                onChange={handleChange}
-              />
-            </div>
+        <div className="container flex flex-col space-y-4">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-2xl font-bold">Database Configurations</h2>
+            <Button 
+              type="button" 
+              onClick={addDatabase}
+              className="bg-green-600"
+            >
+              Add Database
+            </Button>
+          </div>
 
-            <div className="flex flex-col grow">
-              <label htmlFor="bucket" className="mb-2 font-medium">Bucket</label>
-              {/* <Input
-                id="bucket"
-                placeholder="Bucket"
-                name="bucket"
-                value={data.result.bucket}
-                onChange={handleChange}
-              /> */}
+          {data?.result?.databases?.map((db) => {
+            const isSaving = savingIds.includes(db.id);
+            
+            return (
+              <div key={db.id} className="border rounded-lg shadow-sm">
+                <div className="flex items-center justify-between p-4">
+                  <div className="flex items-center gap-4 flex-1">
+                    {/* {db.id} */}
+                    <Input
+                      placeholder="Database Name"
+                      value={db.name}
+                      onChange={(e) => handleDatabaseChange(db.id, 'name', e.target.value)}
+                      onKeyPress={(e) => handleKeyPress(e, db)}
+                      disabled={isSaving}
+                      className="max-w-xs font-bold"
+                      data-id={db.id}
+                    />
+                    <label className="flex items-center">
+                      <input
+                        type="checkbox"
+                        checked={db.enabled}
+                        onChange={(e) => handleDatabaseChange(db.id, 'enabled', e.target.checked)}
+                        disabled={isSaving}
+                        className="mr-2"
+                      />
+                      Enabled
+                    </label>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button 
+                      className='bg-green-600' 
+                      onClick={() => update(db)}
+                      disabled={isSaving}
+                    >
+                      {isSaving ? (
+                        <>
+                          <Loading className="mr-2 h-4 w-4" />
+                          Saving...
+                        </>
+                      ) : (
+                        <>
+                          <Check className="mr-2"/>
+                          Save
+                        </>
+                      )}
+                    </Button>
+                    <Button 
+                      type="button"
+                      onClick={() => toggleExpand(db.id)}
+                      variant="outline"
+                      disabled={isSaving}
+                    >
+                      {db.expanded ? 'Show Less' : 'Show More'}
+                    </Button>
+                    <Button 
+                      type="button"
+                      onClick={() => removeDatabase(db.id)}
+                      className="bg-red-600"
+                      disabled={isSaving}
+                    >
+                      <Trash className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+
+                {db.expanded && (
+                  <div className="p-4 border-t">
+                    {/* Database Settings */}
+                    <div className="mb-6">
+                      <h3 className="font-bold text-lg mb-4">Database Settings</h3>
+                      <div className="grid grid-cols-3 gap-4">
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Database Type</label>
+                          <Input
+                            value={db.databaseType}
+                            onChange={(e) => handleDatabaseChange(db.id, 'databaseType', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">User</label>
+                          <Input
+                            value={db.user}
+                            onChange={(e) => handleDatabaseChange(db.id, 'user', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Password</label>
+                          <Input
+                            type="password"
+                            value={db.password}
+                            onChange={(e) => handleDatabaseChange(db.id, 'password', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Host</label>
+                          <Input
+                            value={db.host}
+                            onChange={(e) => handleDatabaseChange(db.id, 'host', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Port</label>
+                          <Input
+                            value={db.port}
+                            onChange={(e) => handleDatabaseChange(db.id, 'port', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Database</label>
+                          <Input
+                            value={db.database}
+                            onChange={(e) => handleDatabaseChange(db.id, 'database', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* S3 and Cron Settings */}
+                    <div className="mb-6">
+                      <h3 className="font-bold text-lg mb-4">S3 and Cron Settings</h3>
+                      <div className="grid grid-cols-4 gap-4">
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Device Label</label>
+                          <Input
+                            value={db.device}
+                            onChange={(e) => handleDatabaseChange(db.id, 'device', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Bucket</label>
+                          <select
+                            className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+                            value={db.bucket}
+                            onChange={(e) => handleDatabaseChange(db.id, 'bucket', e.target.value)}
+                            disabled={isSaving}
+                          >
+                            {data?.buckets?.map((bucket) => (
+                              <option key={bucket} value={bucket}>{bucket}</option>
+                            ))}
+                          </select>
+                        </div>
+                        {JSON.stringify(db, null, 2)}
+
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Files to Keep</label>
+                          <Input
+                            type="number"
+                            min={1}
+                            value={db.s3MaxFilesToKeep}
+                            onChange={(e) => handleDatabaseChange(db.id, 's3MaxFilesToKeep', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Cron</label>
+                          <Input
+                            value={db.cron}
+                            onChange={(e) => handleDatabaseChange(db.id, 'cron', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                          <div className={twMerge(
+                            cronToText(db.cron)?.error ? 'text-red-500' : 'text-gray-500'
+                          )}>
+                            {cronToText(db.cron)?.text}
+                            {cronToText(db.cron)?.error}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Redis Settings */}
+                    <div className="mb-6">
+                      <h3 className="font-bold text-lg mb-4">Redis Settings</h3>
+                      <div className="grid grid-cols-4 gap-4">
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Host</label>
+                          <Input
+                            value={db.redisHost}
+                            onChange={(e) => handleDatabaseChange(db.id, 'redisHost', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">User</label>
+                          <Input
+                            value={db.redisUser}
+                            onChange={(e) => handleDatabaseChange(db.id, 'redisUser', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Port</label>
+                          <Input
+                            value={db.redisPort}
+                            onChange={(e) => handleDatabaseChange(db.id, 'redisPort', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                        <div className="flex flex-col">
+                          <label className="mb-2 font-medium">Password</label>
+                          <Input
+                            type="password"
+                            value={db.redisPassword}
+                            onChange={(e) => handleDatabaseChange(db.id, 'redisPassword', e.target.value)}
+                            onKeyPress={(e) => handleKeyPress(e, db)}
+                            disabled={isSaving}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Action After Success */}
+                    <div>
+                      <h3 className="font-bold text-lg mb-4">Action After Success</h3>
+                      <textarea
+                        value={db.action}
+                        onChange={(e) => handleDatabaseChange(db.id, 'action', e.target.value)}
+                        className="w-full p-2 border border-gray-300 rounded-md shadow-sm"
+                        rows={3}
+                        disabled={isSaving}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="container w-full flex flex-col mt-3">
+          <div className="mb-4 flex flex-row justify-between items-center">
+              <label className="font-medium">Filtrar por Banco de Dados:</label>
               <select
-                id="bucket"
-                name="bucket"
-                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                value={data.result.bucket}
-                onChange={handleChange}
+                className="flex h-9 w-full max-w-xs rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+                value={selectedBucket}
+                onChange={(e) => _setSelectedBucket(e.target.value)}
               >
+                <option value="all">Todos os Buckets</option>
                 {data?.buckets?.map((bucket) => (
-                  <option key={bucket} value={bucket}>{bucket}</option>
+                  <option key={bucket} value={bucket}>
+                    {bucket}
+                  </option>
                 ))}
               </select>
-            </div>
-
-            <div className="flex flex-col grow w-24" >
-              <label htmlFor="s3MaxFilesToKeep" className="mb-2 font-medium">Number of Files to keep</label>
-              <Input
-                id="s3MaxFilesToKeep"
-                placeholder="Number of Files to keep"
-                name="s3MaxFilesToKeep"
-                type="number"
-                min={1}
-                value={data.result.s3MaxFilesToKeep}
-                onChange={handleChange}
-              />
-            </div>
-
-            <div className="flex flex-col grow w-24" >
-              <label htmlFor="cron" className="mb-2 font-medium">Cron</label>
-              <Input
-                id="cron"
-                placeholder="Cron"
-                name="cron"
-                value={data.result.cron}
-                onChange={handleChange}
-              />
-              <div className={twMerge(
-              textCron?.error ? 'text-red-500' : 'text-gray-500'
-                )}>
-                {textCron?.text}
-                {textCron?.error}
-              </div>
-            </div>
-
           </div>
 
-          {/* Database */}
-          <p className="font-bold text-xl">Database info</p>
-          <div className="flex gap-2">
-
-            <div className="flex flex-col grow ">
-              <label htmlFor="databaseType" className="mb-2 font-medium">Database type (postgres, mysql, sqlite...)</label>
-              <Input
-                id="databaseType"
-                placeholder="databaseType"
-                name="databaseType"
-                value={data.result.databaseType}
-                onChange={handleChange}
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="user" className="mb-2 font-medium">user</label>
-              <Input
-                id="user"
-                placeholder="user"
-                name="user"
-                value={data.result.user}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="password" className="mb-2 font-medium">password</label>
-              <Input
-                id="password"
-                placeholder="password"
-                name="password"
-                type="password"
-                value={data.result.password}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="host" className="mb-2 font-medium">host</label>
-              <Input
-                id="host"
-                placeholder="host"
-                name="host"
-                value={data.result.host}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="port" className="mb-2 font-medium">port</label>
-              <Input
-                id="port"
-                placeholder="port"
-                name="port"
-                value={data.result.port}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="host" className="mb-2 font-medium">database</label>
-              <Input
-                id="database"
-                placeholder="database"
-                name="database"
-                value={data.result.database}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-            
-          </div>
-
-          {/* Redis */}
-          <p className="font-bold text-xl">Redis</p>
-          <div className="flex gap-2">
-
-            <div className="flex flex-col">
-              <label htmlFor="host" className="mb-2 font-medium">host</label>
-              <Input
-                id="host"
-                placeholder="host"
-                name="host"
-                value={data.result.host}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="redisUser" className="mb-2 font-medium">Redis User</label>
-              <Input
-                id="redisUser"
-                placeholder="Redis User"
-                name="redisUser"
-                value={data.result.redisUser}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="redisPort" className="mb-2 font-medium">Redis Port</label>
-              <Input
-                id="redisPort"
-                placeholder="redisPort"
-                name="redisPort"
-                value={data.result.redisPort}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col">
-              <label htmlFor="p" className="mb-2 font-medium">Redis Password</label>
-              <Input
-                id="redisPassword"
-                placeholder="redisPassword"
-                name="redisPassword"
-                type="password"
-                value={data.result.redisPassword}
-                onChange={handleChange}
-                className="grow"
-              />
-            </div>
-
-            <div className="flex flex-col h-full mt-2">
-              <p className="invisible">_</p>
-              <Button className='bg-green-600' onClick={update} disabled={isSaveDisabled}>
-                <Check className="mr-2"/>
-                Save
-              </Button>
-            </div>
-            
-          </div>
-
-          <div className="flex flex-col">
-              <label htmlFor="p" className="mb-2 font-medium">CURL after success</label>
-              <textarea
-                id="action"
-                placeholder="action"
-                name="action"
-                value={data.result.action}
-                onChange={handleChange as any}
-                className="w-full p-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-              />
-            </div>
-        </form>
-
-        <div className="flex justify-between">
-          <Button className='bg-blue-400' onClick={newBackup} disabled={loading}>
-            {loading ? <Loading/> : <Cloud className="mr-3"/>}
-
-            {loading ? 'Loading...' : 'Backup now !' }
-          </Button>
-          <div className="mt-2">
-            Database connected current count: 
-            <span className=" ml-5 bg-green-700 text-white text-xs p-1 rounded-xl">
-              {data?.count}
-            </span>
-          </div>
-          <div className="mt-2">
-            Last record of tabled orders: {data?.last_sale}
-          </div>
-        </div>
-      </div>
-
-      <div className="container">
-        {/* {JSON.stringify(data)} */}
-        <Table>
-          <TableCaption>
-            S3 bucket files
-          </TableCaption>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-[100px]">Size</TableHead>
-              <TableHead>Keys</TableHead>
-              <TableHead>Filename - File Key</TableHead>
-              <TableHead>Date</TableHead>
-              <TableHead>Time</TableHead>
-              <TableHead>Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {data?.files?.map((file, id) => (
-              <TableRow key={file.key}>
-                <TableCell>
-                  {Math.round(file.size / 1000000)} mb
-                </TableCell>
-                <TableCell>
-                  {file.tags?.map((tag) => (
-                    <span key={tag.Key} className="mr-2 bg-blue-700 text-white text-xs p-1 rounded-xl">
-                      {tag.Key}: {tag.Value}
-                    </span>
-                  ))}
-                </TableCell>
-                <TableCell className="font-medium">{file.key}</TableCell>
-                <TableCell>{dayjs(new Date(file.lastModified)).format('DD / MM / YYYY')}</TableCell>
-                <TableCell>{dayjs(new Date(file.lastModified)).format('HH:mm')}</TableCell>
-                <TableCell className="flex flex-col">
-                  {confirmRemoveId === file.key ?
-                    <div className="bg-red-700 pt-2">
-                      <div>
-                        <button
-                          type="button"
-                          className={"ml-2 text-white bg-green-600 border border-green-700 hover:bg-green-700 hover:text-white focus:ring-4 focus:outline-none focus:ring-green-300 font-medium rounded-full text-sm text-center inline-flex items-center dark:border-green-500 dark:text-green-500 dark:hover:text-white dark:focus:ring-green-800 dark:hover:bg-green-500"}
-                          onClick={()=>remove(file.key)}
-                          disabled={loadingRemove}
-                        >
-                          {loadingRemove ? <Loading className="m-1"/> : <Check className="m-1"/>}
-                        </button>
-                        <button
-                          type="button"
-                          className={"ml-2 text-white bg-gray-600 border border-gray-700 hover:bg-gray-700 hover:text-white focus:ring-4 focus:outline-none focus:ring-gray-300 font-medium rounded-full text-sm text-center inline-flex items-center dark:border-gray-500 dark:text-gray-500 dark:hover:text-white dark:focus:ring-gray-800 dark:hover:bg-gray-500"}
-                          onClick={()=>{
-                            confirmRemoveId && setConfirmRemoveId(null)
-                          }}
-                          disabled={loadingRemove}
-                        >
-                          <X className="m-1"/>
-                        </button>
-                      </div>
-                      <div className="text-white pl-3 pb-2">
-                        <span className="text-2xl">
-                          Confirm remove ? 
-                        </span>
-                        <p></p>
-                        <span className="text-xs">
-                          <p className="font-bold">
-                            File {file.key} will be permanently removed
-                          </p>
-                        </span>
-                        <p>Be careful, this operation cannot be reverted !</p>
-                      </div>
-                    </div> :
+          <Table>
+            <TableCaption>
+              Arquivos do bucket S3 {selectedBucket !== 'all' && `para ${selectedBucket}`}
+            </TableCaption>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[100px]">Tamanho</TableHead>
+                <TableHead>Tags</TableHead>
+                <TableHead>Nome do Arquivo - Chave</TableHead>
+                <TableHead>Banco de Dados</TableHead>
+                <TableHead>Data</TableHead>
+                <TableHead>Hora</TableHead>
+                <TableHead>Ações</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {files?.map((file, id) => (
+                <TableRow key={file.key}>
+                  <TableCell>
+                    {Math.round(file.size / 1000000)} mb
+                  </TableCell>
+                  <TableCell>
+                    {file.tags?.map((tag) => (
+                      <span key={tag.Key} className="mr-2 bg-blue-700 text-white text-xs p-1 rounded-xl">
+                        {tag.Key}: {tag.Value}
+                      </span>
+                    ))}
+                  </TableCell>
+                  <TableCell className="font-medium">{file.key}</TableCell>
+                  <TableCell>
+                    {file.tags?.find(tag => tag.Key === 'database')?.Value || '-'}
+                  </TableCell>
+                  <TableCell>{dayjs(new Date(file.lastModified)).format('DD / MM / YYYY')}</TableCell>
+                  <TableCell>{dayjs(new Date(file.lastModified)).format('HH:mm')}</TableCell>
+                  <TableCell className="flex flex-col">
                     <div className="flex">
                       <button
                         type="button"
@@ -628,32 +748,36 @@ export default function Index() {
                           "pr-2 text-white bg-blue-500 border border-blue-700 hover:bg-blue-700 hover:text-white focus:ring-4 focus:outline-none focus:ring-blue-300 font-medium rounded-full text-sm text-center inline-flex items-center dark:border-blue-500 dark:text-blue-500 dark:hover:text-white dark:focus:ring-blue-800 dark:hover:bg-blue-500",
                           id === clickedId && 'bg-green-600'
                         )}
-                        onClick={()=>{
+                        onClick={() => {
                           setClickedId(id)
                           setAction('restore' as any)
                           restore(file.key)
                         }}
                       >
-                        {/* {clickedId} */}
                         {id === clickedId ? <Loading className="ml-3"/> : <Download className="m-1"/>}
-                        {id === clickedId ? 'Restoring...' : 'Restore'}
+                        {id === clickedId ? 'Restaurando...' : 'Restaurar'}
                       </button>
                       <button
                         type="button"
                         className={"ml-2 text-white bg-red-600 border border-red-700 hover:bg-red-700 hover:text-white focus:ring-4 focus:outline-none focus:ring-red-300 font-medium rounded-full text-sm text-center inline-flex items-center dark:border-red-500 dark:text-red-500 dark:hover:text-white dark:focus:ring-red-800 dark:hover:bg-red-500"}
+                        onClick={() => {
+                          if (window.confirm(`Tem certeza que deseja remover o arquivo ${file.key}?`)) {
+                            remove(file.key);
+                          }
+                        }}
                       >
-                        <Trash className="m-1" onClick={()=>setConfirmRemoveId(file.key)}/>
+                        <Trash className="m-1"/>
                       </button>
                     </div>
-                  }
-                </TableCell>
-                
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>     
+                  </TableCell>
+                  
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>     
 
-      </div>
-    </section>
+        </div>
+      </section>
+    </>
   );
 }

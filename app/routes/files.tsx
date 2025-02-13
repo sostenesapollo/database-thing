@@ -4,7 +4,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import { getBucketName } from "./backup";
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import fs from 'fs/promises';
-import { countRecords } from "~/lib/postgres";
+import { countDatabaseRows } from "~/lib/postgres";
 
 console.log({
   region: process.env?.STORAGE_REGION,
@@ -22,11 +22,13 @@ const s3 = new S3Client({
 } as any);
 
 export const loader: LoaderFunction = async ({request}: any) => {
-  const bucket = await getBucketName()
-  const files = await getFiles(bucket)
+    const url = new URL(request.url);
+    const bucket = url.searchParams.get("bucket");
+  
+  const files = await getFilesFromS3(bucket)
 
   return {
-    files
+    files: files
   };
 };
 
@@ -38,7 +40,7 @@ export const action: LoaderFunction = async ({request}: any) => {
   return { result };
 }
 
-export async function getFiles(bucket: string) {
+export async function getFilesFromS3(bucket: string) {
   const params = { Bucket: bucket };
   const data = await s3.send(new ListObjectsV2Command(params));
   
@@ -80,7 +82,7 @@ export async function uploadFile(filePath: string, bucket: string, key: string) 
     let count: number | undefined;
 
     try {
-      const rst = await countRecords();
+      const rst = await countDatabaseRows();
       count = rst.count;
     } catch (error) {
       console.error('Error getting record count:', error);

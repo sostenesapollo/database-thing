@@ -40,35 +40,57 @@ async function getSettings() {
 		const settings = JSON.parse(result?.value) as typeof presetValues;
 		return settings;  
 	}catch(e) {
+		console.log('Error in get settings', e)
 		return {}
 	}
 }
 
-const backup = () => {
-	console.log('Backup triggered.');
-	axios.get(`http://localhost:${process.env.PORT}/events?action=backup`).catch(e=>{
+const backup = (name, databaseId) => () => {
+	console.log('backup')
+	if(!databaseId) {
+		return console.log('No database ID provided.');
+	}
+	console.log(`🟢 Backup triggered for ${name}`);
+	axios.get(`http://localhost:${process.env.PORT}/events?action=backup&databaseId=${databaseId}`).catch(e=>{
 		console.log(e);
 	})
 }
 
-let prevCron = null as string | null;
-var task = cron.schedule('0 * * * *', backup, { scheduled: true });
+let prevSettingsAll = [];
+var task = cron.schedule('0 * * * *', backup(null, null), { scheduled: true });
 
 setInterval(async ()=>{
+
 	try {
-		const settings = await getSettings()
-		const newCron = settings.cron
-		
-		if(prevCron !== newCron){
-			console.log('cron set to', newCron, cronToText(newCron));
-			prevCron = newCron;
-			
-			task.stop()
-			task = cron.schedule(newCron, backup, { scheduled: true });	
-		}	
+		const settingsAll = await getSettings()
+		// This loop is just to verify is there's any update in settings using database
+		settingsAll?.databases?.forEach(databaseSettings=>{
+			const newCron = databaseSettings.cron
+			const prevCron = prevSettingsAll?.find(prev=>prev.id === databaseSettings.id)?.cron
+
+			// if(!databaseSettings.enabled) {
+			// 	console.log(`${databaseSettings.name} is disabled`)
+			// } else {
+			// 	console.log()
+			// }
+
+			if(databaseSettings.enabled) {
+				console.log('ok', databaseSettings.name, databaseSettings.id)
+				backup(databaseSettings.name, databaseSettings.id)()
+			}
+
+			if (prevCron !== newCron) {
+				console.log(`${databaseSettings.name} cron set to`, newCron, cronToText(newCron));
+				prevSettingsAll = settingsAll?.databases;
+
+				task.stop()
+				task = cron.schedule(newCron, backup(databaseSettings.name, databaseSettings.id), {scheduled: true});
+			}
+		})
 	}catch(e) {
+		console.log('Error in CRON interval')
 		console.log(e);
 	}
-},1000)
+},3000)
 
 export { prisma };

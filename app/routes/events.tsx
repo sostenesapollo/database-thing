@@ -1,5 +1,5 @@
 import { LoaderFunction } from "@remix-run/node";
-import { backupDatabase, restoreDatabase } from "~/lib/backup";
+import {backupDatabase, restoreDatabase} from "~/lib/backup";
 import { downloadFile } from "./files";
 
 const logger = (sendEvent:any) => (message: any) => {
@@ -33,11 +33,14 @@ export const loader: LoaderFunction = async ({ request }) => {
       log('Backup started');
 
       if(action === 'backup'){
-        backupDatabase().then((msg)=>{
+        const databaseId = url.searchParams.get("databaseId")
+
+        backupDatabase(databaseId).then((msg)=>{
           log({success: 'Backup completed' });
           log({success: msg });
           closeStream();
         }).catch(e=>{
+          console.log('Error to backup', e)
           log({ error: e.message })
           closeStream();
         })

@@ -19,11 +19,12 @@ export const listBuckets = async () => {
     const command = new ListBucketsCommand({});
     const response = await client.send(command);
     
-    const buckets = response.Buckets?.map(e=>e.Name);
+    const buckets = response?.Buckets?.map(e=>e.Name) || [];
 
     return buckets;
   } catch (err) {
     console.log("Error to list buckets:", err);
+    return []
   }
 };
 
@@ -102,14 +103,22 @@ export const restoreDatabase = async (file: string, log=console.log) => {
 
 };
 
-export const backupDatabase = async (log = console.log) => {
+export type typeDb = { user: string, password: string, host: string, port: string, database: string }
+
+export const getDbSettingsById = async (id: string) => {
   const settings = await getSettings()
-  const { user, password, host, port, database } = settings;
+  return settings.databases.find(e=>e.id===id)
+}
+
+export const backupDatabase = async (databaseSettingsId: string, log = console.log) => {
+  
+  const dbSettings = await getDbSettingsById(databaseSettingsId)
+
+  const { user, password, host, port, database, device, bucket } = dbSettings;
 
   const DATABASE_URL = `postgresql://${user}:${password}@${host}:${port}/${database}`;
   const formattedDate = dayjs().format('YYYY-MM-DD____HH:mm:ss');
-  const bucket = await getBucketName();
-  const filename = `${await getDeviceName()}__${bucket}__${formattedDate}.tar.gz`;
+  const filename = `${device}__${bucket}__${formattedDate}.tar.gz`;
   const path = filename;
 
   try {
@@ -175,7 +184,7 @@ const triggerCurlStep = async (log = console.log, filename: string) => {
 
     log('Create local script file.');
     
-    const size = await getFileSizeInMB(filename)
+    const size = await getFilesFromS3izeInMB(filename)
 
     console.log(settings);
 
@@ -288,7 +297,7 @@ export async function removeFile(file: string) {
   await fs.unlink(filePath);
 }
 
-const getFileSizeInMB = async (filePath: string): Promise<string> => {
+const getFilesFromS3izeInMB = async (filePath: string): Promise<string> => {
   try {
     const stats = await fs.stat(filePath);
     const fileSizeInBytes = stats.size;
