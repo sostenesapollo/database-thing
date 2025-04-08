@@ -1,5 +1,5 @@
 {
-  "name": "remix-shadcn-darkmode",
+  "name": "remix-shadcn-darkmodes",
   "private": true,
   "sideEffects": false,
   "type": "module",
