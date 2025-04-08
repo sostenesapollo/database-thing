@@ -36,6 +36,8 @@ function getClient() {
 
 async function getSettings() {
 	const result = await prisma.setting.findFirst();
+	console.log('> settings:'result);
+	
 	try {
 		const settings = JSON.parse(result?.value) as typeof presetValues;
 		return settings;  
